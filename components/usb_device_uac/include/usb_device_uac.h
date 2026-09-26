@@ -46,6 +46,17 @@ typedef struct  {
  */
 esp_err_t uac_device_init(uac_device_config_t *config);
 
+/**
+ * @brief Offset the asynchronous OUT feedback rate from nominal.
+ *
+ * The value is converted outside the SOF callback to both full-speed and
+ * high-speed 16.16 feedback words. TinyUSB performs the required FS 10.14
+ * conversion for macOS at the endpoint boundary.
+ *
+ * @param ppm Signed rate offset in parts per million (clamped to +/-2000).
+ */
+void uac_device_set_feedback_ppm(int32_t ppm);
+
 #ifdef __cplusplus
 }
 #endif

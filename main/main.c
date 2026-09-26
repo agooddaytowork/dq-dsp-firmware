@@ -164,10 +164,11 @@ void app_main(void)
         initial_config.routing[1][3].enabled = 1;
         initial_config.routing[1][3].gain = 1.0f;
 
-        /* Drift compensation PI controller defaults */
-        initial_config.system.drift_kp = 0.3f;
-        initial_config.system.drift_ki = 0.05f;
-        initial_config.system.drift_target_fill = 0.5f;
+        /* Adaptive UAC feedback defaults; preserve the legacy wire layout. */
+        initial_config.system.drift_kp = 25.0f;
+        initial_config.system.drift_ki = 0.50f;
+        initial_config.system.drift_target_fill = 24.0f * (CONFIG_UAC_SAMPLE_RATE / 1000)
+                                                 * 2 * (CONFIG_UAC_BIT_DEPTH / 8) / (192 * 1024);
         initial_config.system.drift_max_ppm = 200.0f;
     }
 

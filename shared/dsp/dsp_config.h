@@ -118,12 +118,12 @@ typedef struct {
     uint32_t crc32;
 } dsp_header_t;
 
-/** System-level tuning (drift compensation PI controller) */
+/** System-level tuning (adaptive USB feedback; binary layout unchanged) */
 typedef struct {
-    float    drift_kp;          // proportional gain (default 0.3)
-    float    drift_ki;          // integral gain (default 0.05)
-    float    drift_target_fill; // ring buffer fill target 0..1 (default 0.5)
-    float    drift_max_ppm;     // max correction ±ppm (default 200)
+    float    drift_kp;          // feedback P gain, ppm/ms (default 25)
+    float    drift_ki;          // feedback I gain, ppm/(ms*s) (default 0.5)
+    float    drift_target_fill; // legacy ABI field; firmware uses a fixed 24 ms cushion
+    float    drift_max_ppm;     // max host feedback ±ppm (clamped to 20..200)
 } dsp_system_t;
 
 /** Complete DSP configuration (memory-mappable from binary) */
