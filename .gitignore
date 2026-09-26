@@ -19,3 +19,7 @@ sdkconfig.old
 __pycache__/
 *.pyc
 .venv/
+
+# Generated release package
+dist/
+dq-dsp-firmware.bin
