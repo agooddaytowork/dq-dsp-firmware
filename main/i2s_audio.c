@@ -21,13 +21,9 @@ esp_err_t i2s_audio_init_dual_output(uint32_t sample_rate)
 
     /* ---------- I2S0 -- left speaker ----------
      *
-     * auto_clear=false: at 24-bit/96kHz the DMA buffer holds only ~30 ms of
-     * audio (12 × 240 × 8 bytes). With auto_clear=true the IDF driver zeroes
-     * any descriptor it consumes before the audio task refills it. That
-     * produces persistent silence whenever the USB→ASRC→I2S pipeline lags
-     * even briefly. Leaving auto_clear=false makes brief stalls audible
-     * (replay of the previous descriptor) which is the lesser evil and is
-     * what the audio task already handles via the drift PI controller.
+     * auto_clear=true outputs silence on underrun instead of replaying an old
+     * DMA descriptor. USB feedback follows this fixed physical output clock;
+     * the audio task primes a ring cushion before playback.
      *
      * Clock source: ESP32-S3 only exposes XTAL (40 MHz) and PLL_F160M for I2S
      * (no APLL on S3 I2S unit). Default PLL_F160M divides to 96 kHz × 64fs =
@@ -104,8 +100,7 @@ void i2s_audio_write_dual(const uint8_t *buf_i2s0, const uint8_t *buf_i2s1, size
 void i2s_audio_reconfig_sample_rate(int sample_rate)
 {
     /* Disable → reconfig → enable. This causes a brief gap (~1ms).
-     * Called by drift PI controller only when correction changes by ≥5 ppm,
-     * which should be infrequent (every few seconds at most). */
+     * USB clock recovery never calls this: it adjusts host feedback instead. */
     i2s_channel_disable(i2s_tx_chan0);
     i2s_channel_disable(i2s_tx_chan1);
 

@@ -19,6 +19,21 @@
 
 static const char *TAG = "usbd_uac";
 
+/* Precomputed 16.16 feedback words. They are written by the slow app-ring
+ * controller and read atomically by TinyUSB's SOF callback. */
+static volatile uint32_t s_feedback_fs_16_16 = 0;
+static volatile uint32_t s_feedback_hs_16_16 = 0;
+
+static uint32_t feedback_word_16_16(uint32_t sample_rate,
+                                    uint32_t frames_per_second,
+                                    int32_t ppm)
+{
+    uint64_t nominal = ((uint64_t)sample_rate << 16) / frames_per_second;
+    int64_t adjusted = (int64_t)nominal +
+        ((int64_t)nominal * (int64_t)ppm) / 1000000LL;
+    return adjusted > 0 ? (uint32_t)adjusted : 1U;
+}
+
 const uint32_t sample_rates[] = {DEFAULT_SAMPLE_RATE};
 
 #define N_SAMPLE_RATES  TU_ARRAY_SIZE(sample_rates)
@@ -71,6 +86,19 @@ static uac_device_t *s_uac_device = NULL;
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 #define UAC_ENTER_CRITICAL()    portENTER_CRITICAL(&s_mux)
 #define UAC_EXIT_CRITICAL()     portEXIT_CRITICAL(&s_mux)
+
+void uac_device_set_feedback_ppm(int32_t ppm)
+{
+    if (!s_uac_device) return;
+    if (ppm > 2000) ppm = 2000;
+    if (ppm < -2000) ppm = -2000;
+
+    uint32_t sample_rate = s_uac_device->current_sample_rate;
+    uint32_t fs_word = feedback_word_16_16(sample_rate, 1000U, ppm);
+    uint32_t hs_word = feedback_word_16_16(sample_rate, 8000U, ppm);
+    __atomic_store_n(&s_feedback_fs_16_16, fs_word, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_feedback_hs_16_16, hs_word, __ATOMIC_RELEASE);
+}
 
 static void usb_phy_init(void)
 {
@@ -193,11 +221,43 @@ void tud_audio_feedback_params_cb(uint8_t func_id, uint8_t alt_itf, audio_feedba
 {
     (void)func_id;
     (void)alt_itf;
-    // Set feedback method to fifo counting
-    feedback_param->method = AUDIO_FEEDBACK_METHOD_FIFO_COUNT;
+
+    /* The app ring is downstream of TinyUSB's EP-OUT FIFO and is paced by the
+     * physical I2S/DAC clock, so the firmware owns a manual adaptive feedback
+     * word. Do not use TinyUSB FIFO_COUNT here: the synchronous RX callback
+     * drains that FIFO immediately and it does not represent DAC consumption. */
+    feedback_param->method = AUDIO_FEEDBACK_METHOD_DISABLED;
     feedback_param->sample_freq = s_uac_device->current_sample_rate;
 
-    ESP_LOGD(TAG, "Feedback method: %d, sample freq: %"PRIu32"", feedback_param->method, feedback_param->sample_freq);
+    ESP_LOGI(TAG, "Feedback: adaptive/manual, app ring owns clock recovery (%"PRIu32" Hz)",
+             feedback_param->sample_freq);
+}
+
+/* TinyUSB invokes this callback at the feedback endpoint interval from its SOF
+ * path. tud_audio_n_fb_set() expects samples per USB (micro)frame in 16.16.
+ * TinyUSB then converts to full-speed 10.14 when the format-correction callback
+ * requests it (macOS); Windows receives the required 16.16 value.
+ *
+ * ESP32-S3 uses full-speed USB, but retain the high-speed divisor so this code
+ * remains correct if the component is moved to a high-speed target. */
+TU_ATTR_FAST_FUNC void tud_audio_feedback_interval_isr(uint8_t func_id,
+                                                       uint32_t frame_number,
+                                                       uint8_t interval_shift)
+{
+    (void)frame_number;
+    (void)interval_shift;
+
+    bool high_speed = tud_speed_get() == TUSB_SPEED_HIGH;
+    uint32_t feedback = __atomic_load_n(
+        high_speed ? &s_feedback_hs_16_16 : &s_feedback_fs_16_16,
+        __ATOMIC_ACQUIRE);
+    if (feedback == 0) {
+        const uint32_t frames_per_second = high_speed ? 8000U : 1000U;
+        feedback = (uint32_t)(
+            ((uint64_t)s_uac_device->current_sample_rate << 16) /
+            frames_per_second);
+    }
+    tud_audio_n_fb_set(func_id, feedback);
 }
 
 // Helper for feature unit get requests
@@ -375,36 +435,38 @@ bool tud_audio_rx_done_post_read_cb(uint8_t rhport, uint16_t n_bytes_received, u
     (void)ep_out;
     (void)cur_alt_setting;
 
-    static bool new_play = false;
-    static int64_t last_time = 0;
-    int64_t now = esp_timer_get_time();
-
-    /**
-     * @brief If no data is received for a certain period, it is considered as the initiation
-     *        of a new audio transmission. At this point, the FIFO data is cleared, and a segment
-     *        of data is buffered in the I2S.
-     */
-    if (now - last_time > 100 * CONFIG_UAC_SPK_NEW_PLAY_INTERVAL) {
-        new_play = true;
-        tud_audio_clear_ep_out_ff();
+    /* Forward every complete frame, including the extra frames requested by
+     * positive feedback. Reading only nominal bytes/ms would trap those extra
+     * samples in TinyUSB's FIFO and hide them from the app-ring controller.
+     * Startup buffering belongs to the I2S-paced application ring. */
+    size_t frame_bytes = SPEAK_CHANNEL_NUM * s_uac_device->spk_resolution / 8;
+    if (frame_bytes == 0) return true;
+    size_t bytes_require = tud_audio_available();
+    if (bytes_require > sizeof(s_uac_device->spk_buf)) {
+        bytes_require = sizeof(s_uac_device->spk_buf);
     }
-    last_time = now;
+    bytes_require -= bytes_require % frame_bytes;
+    if (bytes_require == 0) return true;
 
-    int bytes_remained = tud_audio_available();
-
-    size_t bytes_require = s_uac_device->spk_bytes_per_ms;
-
-    if (new_play) {
-        /*!< Buffer a segment of data in the I2S and control the data size to be half of the UAC FIFO size. */
-        bytes_require = SPK_INTERVAL_MS * s_uac_device->spk_bytes_per_ms / 2;
-        if (bytes_remained < bytes_require) {
-            return true;
+    /* Dispatch while spk_buf is owned by this TinyUSB callback.  The original
+     * component handed this single buffer to usb_spk_task and immediately
+     * reused it on the next 1 ms USB transaction.  Task notifications may
+     * coalesce and the TinyUSB task may run again before usb_spk_task copies
+     * the previous packet, so the shared buffer could be overwritten without
+     * any overflow/unaligned counter noticing.  The firmware output callback
+     * is deliberately non-blocking (a zero-timeout copy into its ring), making
+     * synchronous dispatch both bounded and race-free. */
+    int spk_data_size = tud_audio_read(s_uac_device->spk_buf, bytes_require);
+    if (spk_data_size > 0 && s_uac_device->user_cfg.output_cb) {
+        esp_err_t err = s_uac_device->user_cfg.output_cb(
+            (uint8_t *)s_uac_device->spk_buf,
+            (size_t)spk_data_size,
+            s_uac_device->user_cfg.cb_ctx);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Speaker output callback failed: %s",
+                     esp_err_to_name(err));
         }
-        new_play = false;
     }
-
-    s_uac_device->spk_data_size = tud_audio_read(s_uac_device->spk_buf, bytes_require);
-    xTaskNotifyGive(s_uac_device->spk_task_handle);
     return true;
 }
 
@@ -504,6 +566,7 @@ esp_err_t uac_device_init(uac_device_config_t *config)
     s_uac_device->user_cfg.set_mute_cb = config->set_mute_cb;
     s_uac_device->user_cfg.set_volume_cb = config->set_volume_cb;
     s_uac_device->current_sample_rate = DEFAULT_SAMPLE_RATE;
+    uac_device_set_feedback_ppm(0);
     s_uac_device->mic_buf_write = s_uac_device->mic_buf1;
     s_uac_device->mic_buf_read = s_uac_device->mic_buf2;
 

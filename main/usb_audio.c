@@ -89,16 +89,24 @@ static const char *TAG = "usb_audio";
  * Ring buffer and DMA buffers
  * ----------------------------------------------------------------------- */
 
-/* Sized for 24-bit / 96 kHz stereo.
- *   USB byte rate = 96k * 3 * 2 = 576 KB/s
- *   I2S byte rate = 96k * 4 * 2 = 768 KB/s (int32 frames)
- * Ringbuf 192KB ≈ 333ms at 24/96 USB rate.
- * Scratch buffer 16KB ≈ 21ms of int32 stereo @ 96k — comfortably above the
- * largest ASRC chunk produced per ringbuffer dequeue (≤10ms USB packet).
- * Buffer holds ASRC output between USB and I2S; the I2S driver memcpy's
- * from it into its own DMA descriptors, so MALLOC_CAP_DMA is not required. */
+/* Keep wrap boundaries and every read/write aligned to stereo PCM frames. */
 #define USB_AUDIO_RINGBUF_SIZE  (192 * 1024)
-#define USB_AUDIO_DMA_BUF_SIZE  (16  * 1024)
+#define USB_AUDIO_DMA_BUF_SIZE  (16 * 1024)
+#define USB_AUDIO_BYTES_PER_MS  ((CONFIG_UAC_SAMPLE_RATE / 1000) * UAC_BYTES_PER_PAIR)
+#define USB_AUDIO_CUSHION_BYTES (24 * USB_AUDIO_BYTES_PER_MS)
+#define USB_AUDIO_REBUFFER_BYTES (12 * USB_AUDIO_BYTES_PER_MS)
+#define USB_AUDIO_PI_TARGET_BYTES USB_AUDIO_CUSHION_BYTES
+#define USB_AUDIO_BLOCK_FRAMES  (2 * CONFIG_UAC_SAMPLE_RATE / 1000)
+#define USB_AUDIO_BLOCK_BYTES   (USB_AUDIO_BLOCK_FRAMES * 8)
+#define USB_IDLE_THRESHOLD_US  100000
+
+_Static_assert(USB_AUDIO_RINGBUF_SIZE % UAC_BYTES_PER_PAIR == 0,
+               "ring wrap must preserve stereo frame alignment");
+_Static_assert(USB_AUDIO_BLOCK_BYTES <= USB_AUDIO_DMA_BUF_SIZE,
+               "every input block must fit both I2S output buffers");
+
+static volatile bool s_playing = false;
+static int64_t s_last_usb_audio_us = 0; /* accessed atomically across cores */
 
 static RingbufHandle_t s_ringbuf = NULL;
 static uint8_t *s_buf_i2s0 = NULL;
@@ -113,47 +121,33 @@ static volatile bool  s_usb_mute = false;
 static volatile uint32_t s_overflow_count = 0;
 
 /* -----------------------------------------------------------------------
- * PI Controller for USB/I2S clock drift compensation
+ * USB/I2S clock recovery
  *
- * Monitors ring buffer fill level every 100ms (via esp_timer on Core 0).
- * Adjusts I2S sample rate by ±200 ppm to keep buffer at 50% target.
+ * Audio remains sample-exact 1:1 inside the ESP32. A slow PI controller asks
+ * the host for fractionally more/fewer samples per USB frame so the physical
+ * I2S clock owns the rate and the 24 ms app-ring cushion stays centered.
  * ----------------------------------------------------------------------- */
 
 #define DRIFT_TIMER_INTERVAL_US  100000   /* 100ms */
 
-/* Default PI gains — overridden at runtime from dsp_config_t.system */
-#define DRIFT_KP_DEFAULT         0.3f
-#define DRIFT_KI_DEFAULT         0.05f
-#define DRIFT_TARGET_DEFAULT     0.5f
+/* Legacy wire-field names are retained for config compatibility:
+ *   drift_kp = feedback proportional gain, ppm per millisecond
+ *   drift_ki = feedback integral gain, ppm per millisecond-second */
+#define DRIFT_KP_DEFAULT         25.0f
+#define DRIFT_KI_DEFAULT         0.50f
+#define DRIFT_TARGET_DEFAULT     ((float)USB_AUDIO_PI_TARGET_BYTES / (float)USB_AUDIO_RINGBUF_SIZE)
 #define DRIFT_MAX_PPM_DEFAULT    200.0f
+#define DRIFT_MAX_PPM_HARD       200.0f
+#define DRIFT_FILL_LPF_ALPHA     0.10f    /* ~1 s at the 100 ms timer rate */
+#define DRIFT_DEADBAND_MS        0.75f
+#define DRIFT_SLEW_PPM_PER_TICK  2.0f     /* host command changes at <=20 ppm/s */
 
-static float s_drift_integral = 0.0f;
-static float s_drift_prev_ki = 0.0f;                  /* detect Ki changes → reset integral */
-static float s_drift_prev_kp = 0.0f;                  /* detect Kp changes → reset integral */
+static float s_feedback_integral_ppm = 0.0f;
+static float s_drift_filtered_fill = DRIFT_TARGET_DEFAULT;
+static bool s_drift_filter_valid = false;
+static int64_t s_feedback_prev_us = 0;
 static volatile float s_drift_fill_pct = 0.0f;        /* last buffer fill % (for telemetry) */
-static volatile float s_drift_correction_ppm = 0.0f;  /* last PI output (for telemetry) */
-
-/**
- * ASRC (Asynchronous Sample Rate Conversion) drift compensation.
- *
- * Instead of dropping/duplicating integer samples (which causes clicks),
- * the PI controller sets a resampling ratio very close to 1.0.  The audio
- * task uses a fractional phase accumulator with linear interpolation to
- * smoothly resample the input stream, eliminating all discontinuities.
- *
- * s_resample_ratio: 1.0 = no correction
- *                   >1.0 = consume input faster (USB clock faster, buffer filling)
- *                   <1.0 = consume input slower (I2S clock faster, buffer draining)
- * Written by PI timer on Core 0, read by audio task on Core 1.
- */
-static volatile float s_resample_ratio = 1.0f;
-
-/* ASRC interpolation state (persists across ring buffer chunks, audio task only) */
-static float s_asrc_phase  = 1.0f;  /* fractional position; init 1.0 forces first sample load */
-static float s_asrc_prev_l = 0.0f;  /* previous input sample (left) */
-static float s_asrc_prev_r = 0.0f;  /* previous input sample (right) */
-static float s_asrc_cur_l  = 0.0f;  /* current input sample (left) */
-static float s_asrc_cur_r  = 0.0f;  /* current input sample (right) */
+static volatile float s_drift_correction_ppm = 0.0f;  /* UAC feedback offset (telemetry) */
 
 /* DSP telemetry */
 static uint32_t s_dsp_min_us = UINT32_MAX;
@@ -175,7 +169,11 @@ static esp_err_t uac_output_cb(uint8_t *buf, size_t len, void *arg)
 {
     if (!s_ringbuf || len == 0) return ESP_OK;
 
-    /* Only drop at 90% full — PI controller handles normal drift.
+    __atomic_store_n(&s_last_usb_audio_us, esp_timer_get_time(), __ATOMIC_RELAXED);
+    /* The UAC component only dispatches whole stereo frames. */
+    if (len % UAC_BYTES_PER_PAIR != 0) return ESP_ERR_INVALID_SIZE;
+
+    /* Only drop at 90% full — USB feedback handles normal drift.
      * This is a safety net, not the primary drift mechanism. */
     UBaseType_t free_bytes = xRingbufferGetCurFreeSize(s_ringbuf);
     if (free_bytes < USB_AUDIO_RINGBUF_SIZE / 10) {
@@ -219,10 +217,34 @@ static void usb_audio_task(void *arg)
 {
     ESP_LOGI(TAG, "USB audio DSP task started on core %d", xPortGetCoreID());
 
+    bool buffering = true;
     for (;;) {
+        size_t used = USB_AUDIO_RINGBUF_SIZE - xRingbufferGetCurFreeSize(s_ringbuf);
+        if (!buffering && used < USB_AUDIO_REBUFFER_BYTES) {
+            buffering = true;
+        }
+        if (buffering) {
+            s_playing = false;
+            if (used < USB_AUDIO_CUSHION_BYTES) {
+                /* Pace priming with the physical output clock. Filling DMA
+                 * with silence prevents it from swallowing the ring cushion
+                 * in an initial burst when playback starts. */
+                memset(s_buf_i2s0, 0, USB_AUDIO_BLOCK_BYTES);
+                memset(s_buf_i2s1, 0, USB_AUDIO_BLOCK_BYTES);
+                i2s_audio_write_dual(s_buf_i2s0, s_buf_i2s1, USB_AUDIO_BLOCK_BYTES);
+                continue;
+            }
+            buffering = false;
+            s_playing = true;
+        }
+
         size_t item_size = 0;
-        uint8_t *data = (uint8_t *)xRingbufferReceive(s_ringbuf, &item_size, portMAX_DELAY);
+        uint8_t *data = (uint8_t *)xRingbufferReceiveUpTo(
+            s_ringbuf, &item_size, pdMS_TO_TICKS(50),
+            USB_AUDIO_BLOCK_FRAMES * UAC_BYTES_PER_PAIR);
         if (data == NULL || item_size == 0) {
+            buffering = true;
+            s_playing = false;
             continue;
         }
 
@@ -254,37 +276,19 @@ static void usb_audio_task(void *arg)
 
         int64_t t0 = esp_timer_get_time();
 
-        /* ASRC: resample interleaved stereo via fractional phase accumulator
-         * with linear interpolation. Input is 24-bit LE decoded to float; output
-         * is int32 MSB-aligned for a 32-bit I2S slot. PI controller on Core 0
-         * sets s_resample_ratio ≈ 1.0 ± 200ppm. */
+        /* Exactly one DSP/output frame per USB stereo frame. The sole rate
+         * controller adjusts host packet cadence through the feedback EP. */
         float uv = s_usb_mute ? 0.0f : s_usb_volume;
-        float ratio = s_resample_ratio;
         size_t num_pairs = item_size / UAC_BYTES_PER_PAIR;
-        size_t in_idx = 0;
         size_t out_bytes = 0;
 
-        while (out_bytes + 8 <= USB_AUDIO_DMA_BUF_SIZE) {
-            while (s_asrc_phase >= 1.0f) {
-                if (in_idx < num_pairs) {
-                    s_asrc_phase -= 1.0f;
-                    s_asrc_prev_l = s_asrc_cur_l;
-                    s_asrc_prev_r = s_asrc_cur_r;
-                    const uint8_t *p = in + in_idx * UAC_BYTES_PER_PAIR;
-                    s_asrc_cur_l = decode_in(p);
-                    s_asrc_cur_r = decode_in(p + UAC_BYTES_PER_SAMPLE);
-                    in_idx++;
-                } else {
-                    goto asrc_done;
-                }
-            }
-
-            float frac = s_asrc_phase;
-            float interp_l = s_asrc_prev_l + frac * (s_asrc_cur_l - s_asrc_prev_l);
-            float interp_r = s_asrc_prev_r + frac * (s_asrc_cur_r - s_asrc_prev_r);
+        for (size_t in_idx = 0; in_idx < num_pairs; in_idx++) {
+            const uint8_t *p = in + in_idx * UAC_BYTES_PER_PAIR;
+            float sample_l = decode_in(p);
+            float sample_r = decode_in(p + UAC_BYTES_PER_SAMPLE);
 
             float dsp_out[4];
-            dsp_pipeline_process(cfg, interp_l, interp_r, dsp_out);
+            dsp_pipeline_process(cfg, sample_l, sample_r, dsp_out);
 
             int32_t s24[4];
             for (int ch = 0; ch < 4; ch++) {
@@ -297,10 +301,7 @@ static void usb_audio_task(void *arg)
             *out1++ = s24[2] << 8;
             *out1++ = s24[3] << 8;
             out_bytes += 8;
-
-            s_asrc_phase += ratio;
         }
-asrc_done: ;
 
         /* DSP telemetry */
         int64_t elapsed_us = esp_timer_get_time() - t0;
@@ -340,55 +341,103 @@ asrc_done: ;
 }
 
 /* -----------------------------------------------------------------------
- * Drift Compensation Timer (runs on Core 0 via esp_timer)
+ * Adaptive UAC feedback controller (Core 0, 100 ms).
  *
- * Reads ring buffer fill level every 100ms. Computes error vs 50% target.
- * Applies PI controller to derive sample rate correction in ppm.
- * Sets ASRC resampling ratio for smooth fractional interpolation.
+ * Positive feedback PPM asks the USB host for more samples. Therefore a low
+ * ring (negative error) produces a positive command, and a high ring produces
+ * a negative command. The integral learns the fixed USB↔I2S clock offset;
+ * the proportional term rejects short fill excursions. Audio samples remain
+ * strictly 1:1 inside the ESP32.
  * ----------------------------------------------------------------------- */
-
 static void drift_compensation_cb(void *arg)
 {
+    (void)arg;
     if (!s_ringbuf) return;
 
-    /* Read PI gains from active config (tunable via BLE/serial UI) */
-    const dsp_config_t *cfg = dsp_param_get_active();
-    float kp         = cfg->system.drift_kp > 0.0f          ? cfg->system.drift_kp          : DRIFT_KP_DEFAULT;
-    float ki         = cfg->system.drift_ki > 0.0f          ? cfg->system.drift_ki          : DRIFT_KI_DEFAULT;
-    float target     = cfg->system.drift_target_fill > 0.0f ? cfg->system.drift_target_fill : DRIFT_TARGET_DEFAULT;
-    float max_ppm    = cfg->system.drift_max_ppm > 0.0f     ? cfg->system.drift_max_ppm     : DRIFT_MAX_PPM_DEFAULT;
+    int64_t now = esp_timer_get_time();
+    int64_t last_usb_us = __atomic_load_n(&s_last_usb_audio_us, __ATOMIC_RELAXED);
+    bool usb_active = last_usb_us > 0 && (now - last_usb_us) < USB_IDLE_THRESHOLD_US;
 
-    /* Reset integral when PI gains change (prevents windup from stale state) */
-    if (kp != s_drift_prev_kp || ki != s_drift_prev_ki) {
-        s_drift_integral = 0.0f;
-        s_drift_prev_kp = kp;
-        s_drift_prev_ki = ki;
-    }
+
+    const dsp_config_t *cfg = dsp_param_get_active();
+    float kp = (cfg->system.drift_kp >= 5.0f &&
+                cfg->system.drift_kp <= 60.0f)
+             ? cfg->system.drift_kp : DRIFT_KP_DEFAULT;
+    float ki = (cfg->system.drift_ki >= 0.05f &&
+                cfg->system.drift_ki <= 2.0f)
+             ? cfg->system.drift_ki : DRIFT_KI_DEFAULT;
+    float max_ppm = cfg->system.drift_max_ppm > 0.0f
+                  ? cfg->system.drift_max_ppm : DRIFT_MAX_PPM_DEFAULT;
+    if (max_ppm < 20.0f) max_ppm = 20.0f;
+    if (max_ppm > DRIFT_MAX_PPM_HARD) max_ppm = DRIFT_MAX_PPM_HARD;
 
     UBaseType_t free = xRingbufferGetCurFreeSize(s_ringbuf);
     float fill = 1.0f - (float)free / (float)USB_AUDIO_RINGBUF_SIZE;
 
-    /* PI controller: error is positive when buffer is too full (USB faster) */
-    float error = fill - target;
-    s_drift_integral += error;
+    static bool was_playing = false;
+    bool playback_start = s_playing && !was_playing;
+    was_playing = s_playing;
+    if (!s_drift_filter_valid || playback_start) {
+        s_drift_filtered_fill = fill;
+        s_drift_filter_valid = true;
+        s_feedback_prev_us = now;
+    } else if (s_playing && usb_active) {
+        s_drift_filtered_fill +=
+            (fill - s_drift_filtered_fill) * DRIFT_FILL_LPF_ALPHA;
+    }
 
-    /* Clamp integral to prevent windup */
-    float max_integral = (ki > 0.001f) ? max_ppm / ki : max_ppm * 1000.0f;
-    if (s_drift_integral > max_integral) s_drift_integral = max_integral;
-    if (s_drift_integral < -max_integral) s_drift_integral = -max_integral;
+    float target = (float)USB_AUDIO_PI_TARGET_BYTES /
+                   (float)USB_AUDIO_RINGBUF_SIZE;
+    float error_ms = (s_drift_filtered_fill - target) *
+                     (float)USB_AUDIO_RINGBUF_SIZE /
+                     (float)USB_AUDIO_BYTES_PER_MS;
+    float effective_error_ms = 0.0f;
+    if (error_ms > DRIFT_DEADBAND_MS) {
+        effective_error_ms = error_ms - DRIFT_DEADBAND_MS;
+    } else if (error_ms < -DRIFT_DEADBAND_MS) {
+        effective_error_ms = error_ms + DRIFT_DEADBAND_MS;
+    }
 
-    float correction = kp * error * 100.0f + ki * s_drift_integral;
-    if (correction > max_ppm) correction = max_ppm;
-    if (correction < -max_ppm) correction = -max_ppm;
+    float dt_s = s_feedback_prev_us > 0
+               ? (float)(now - s_feedback_prev_us) / 1000000.0f : 0.0f;
+    s_feedback_prev_us = now;
+    if (dt_s < 0.0f || dt_s > 0.5f) dt_s = 0.0f;
 
-    /* Convert ppm correction to ASRC resampling ratio.
-     * ratio >1.0 = consume input faster (USB faster, buffer filling)
-     * ratio <1.0 = consume input slower (I2S faster, buffer draining) */
-    s_resample_ratio = 1.0f + correction / 1000000.0f;
+    if (s_playing && usb_active) {
+        float integral_step = -ki * effective_error_ms * dt_s;
+        float candidate = s_feedback_integral_ppm + integral_step;
+        if (candidate >  max_ppm) candidate =  max_ppm;
+        if (candidate < -max_ppm) candidate = -max_ppm;
 
-    /* Snapshot for telemetry (read by audio task on Core 1) */
+        /* Conditional integration prevents wind-up while the combined P+I
+         * request is already pushing farther into either command rail. */
+        float candidate_request = candidate - kp * effective_error_ms;
+        bool pushes_high_rail = candidate_request > max_ppm &&
+                                integral_step > 0.0f;
+        bool pushes_low_rail = candidate_request < -max_ppm &&
+                               integral_step < 0.0f;
+        if (!pushes_high_rail && !pushes_low_rail) {
+            s_feedback_integral_ppm = candidate;
+        }
+    }
+
+    float requested = s_feedback_integral_ppm;
+    if (s_playing && usb_active) {
+        requested += -kp * effective_error_ms;
+    }
+    if (requested >  max_ppm) requested =  max_ppm;
+    if (requested < -max_ppm) requested = -max_ppm;
+
+    float delta = requested - s_drift_correction_ppm;
+    if (delta >  DRIFT_SLEW_PPM_PER_TICK) delta =  DRIFT_SLEW_PPM_PER_TICK;
+    if (delta < -DRIFT_SLEW_PPM_PER_TICK) delta = -DRIFT_SLEW_PPM_PER_TICK;
+    float feedback_ppm = s_drift_correction_ppm + delta;
+
+    uac_device_set_feedback_ppm((int32_t)lroundf(feedback_ppm));
+
+    /* No local rate conversion: preserve every host PCM sample exactly once. */
     s_drift_fill_pct = fill * 100.0f;
-    s_drift_correction_ppm = correction;
+    s_drift_correction_ppm = feedback_ppm;
 }
 
 /* -----------------------------------------------------------------------
@@ -431,16 +480,16 @@ esp_err_t usb_audio_init(uint32_t sample_rate)
         return err;
     }
 
-    /* Start drift compensation PI controller (100ms interval, Core 0) */
+    /* Start the sole clock-recovery loop: adaptive USB feedback (100 ms) */
     const esp_timer_create_args_t drift_timer_args = {
         .callback = drift_compensation_cb,
-        .name = "drift_pi",
+        .name = "uac_feedback",
     };
     esp_timer_handle_t drift_timer;
-    esp_timer_create(&drift_timer_args, &drift_timer);
-    esp_timer_start_periodic(drift_timer, DRIFT_TIMER_INTERVAL_US);
+    ESP_ERROR_CHECK(esp_timer_create(&drift_timer_args, &drift_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(drift_timer, DRIFT_TIMER_INTERVAL_US));
 
-    ESP_LOGI(TAG, "USB Audio initialized (stereo, %d-bit, %lu Hz, drift PI active)",
+    ESP_LOGI(TAG, "USB Audio initialized (stereo, %d-bit, %lu Hz, adaptive UAC feedback)",
              CONFIG_UAC_BIT_DEPTH, (unsigned long)sample_rate);
     return ESP_OK;
 }

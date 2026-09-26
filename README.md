@@ -25,7 +25,7 @@ over a second USB cable (UART0 over the DevKitC-1's USB-Serial-JTAG port).
 ## 🆕 Hi-res upgrade — 24-bit / 48 kHz
 
 The USB Audio Class endpoint now streams **24-bit / 48 kHz stereo** end-to-end.
-The whole path — TinyUSB ring buffer, ASRC, DSP pipeline, dual I²S TX — was
+The whole path — TinyUSB ring buffer, DSP pipeline, dual I²S TX — was
 widened to a 32-bit slot with 24 valid bits (MSB-aligned), so PCM5102A latches
 the upper 24 bits directly. That's **+48 dB of dynamic-range headroom** over
 the previous 16-bit build with zero compatibility risk on macOS / Windows /
@@ -39,7 +39,7 @@ Linux UAC 1.0 hosts.
 ## Audio path
 
 ```
-USB host  →  TinyUSB UAC ring buffer  →  ASRC (PI controller, ±1400 ppm)
+USB host  →  TinyUSB UAC  →  application ring buffer (24 ms cushion)
           →  DSP pipeline (Core 1):
               input gain · phase · mute
               10-band Room EQ ×2 ch
@@ -95,11 +95,44 @@ ports of the dev-board:
 
 | | |
 |---|---|
-| End-to-end latency | ~10–15 ms typical (USB packet + ring buffer + ASRC + DSP + I²S) |
-| ASRC compensation | PI controller, ±1400 ppm tunable (default Kp 0.10 / Ki 0.020 / target 20 %) |
+| Buffering latency | 24 ms application cushion + up to 60 ms I²S DMA at 48 kHz; host latency additional (not measured end-to-end) |
+| Clock recovery | Adaptive USB feedback, ±200 ppm maximum; one output frame per input frame, no local ASRC |
 | Telemetry rate | 1 Hz over USB CDC (CPU load, drift PPM, buffer fill) |
 | DSP load | ~30–40 % of one Core (Core 1 pinned, 240 MHz) at full pipeline |
 | Atomic config swap | shadow-buffer commit between audio blocks — no clicks on parameter changes |
+
+### USB clock recovery (issue #2)
+
+The USB host and I²S output clocks are independent. A single controller watches
+our I²S-paced application ring and adjusts the asynchronous USB feedback endpoint:
+positive PPM requests more samples from the host, negative PPM requests fewer.
+TinyUSB's separate FIFO-count controller is disabled. DSP processes each incoming
+stereo frame exactly once, without local interpolation or sample-rate changes.
+This ports the TAC5212 adaptive-feedback fix (`d7ba2d4`) and synchronous speaker
+buffer ownership fix (`63eeeb7`) from the DSP repository. The receiver also drains
+extra host frames immediately, so positive feedback reaches the application ring.
+
+Existing presets and serial commands retain their binary layout. The System panel's
+legacy fields now mean:
+
+- **Kp:** feedback proportional gain in ppm/ms; default 25, accepted range 5–60.
+- **Ki:** feedback integral gain in ppm/(ms·s); default 0.5, accepted range 0.05–2.
+- **Target Fill:** retained for compatibility, ignored; the cushion is fixed at
+  24 ms (about 3.5% of the 192 KiB ring at 24-bit/48 kHz).
+- **Max PPM:** clamped to 20–200; zero/unset uses 200.
+
+Out-of-range Kp/Ki values from older presets use the new defaults. The controller
+filters fill measurements, limits its slew to 2 ppm per 100 ms, prevents integral
+wind-up, and suspends integration during pause or priming. Playback primes at
+24 ms and returns to silence/refill below 12 ms. Telemetry reports host feedback
+PPM, whose sign is the opposite of the old ASRC consumption correction.
+
+Run `python3 tests/test_usb_feedback.py` for host-side C regression checks covering
+30-minute drift simulations, pause/resume, saturation, USB extra/partial frames,
+backlog draining, and one-for-one PCM processing. Build with `./idf.sh build`.
+Before a release, verify sustained playback on hardware (at least 30 minutes),
+pause/resume and USB reconnect, on the intended hosts. Host tests cannot verify
+USB host feedback behavior, DMA timing, or audible output.
 
 ### Hardware platform
 
@@ -286,7 +319,7 @@ generated `sdkconfig` is gitignored (user-local).
     .
     ├── main/               # ESP-IDF component
     │   ├── main.c          # app_main: init NVS / DSP / I2S / USB
-    │   ├── usb_audio.c     # TinyUSB UAC + CDC, ASRC PI controller
+    │   ├── usb_audio.c     # TinyUSB UAC + CDC, adaptive USB feedback
     │   ├── i2s_audio.c     # Dual I2S TX driver
     │   ├── serial_server.c # CDC frame parser → dsp_param_apply
     │   ├── Kconfig.projbuild
