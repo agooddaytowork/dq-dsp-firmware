@@ -1,0 +1,80 @@
+name: Build ESP32-S3 firmware
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Check audio clock recovery
+        run: |
+          python3 tests/test_usb_feedback.py
+          python3 -m unittest discover -s tests -p test_package_firmware.py
+
+      - name: Build ESP-IDF 5.2.5 and merge flash image
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.2.5
+          target: esp32s3
+          command: idf.py build && cd build && esptool.py --chip esp32s3 merge_bin -o ../dq-dsp-firmware.bin @flash_args
+
+      - name: Package and verify firmware
+        id: package
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="dev-${GITHUB_SHA:0:7}"
+          fi
+          python3 tools/package_firmware.py --version "$version" --build-dir build --merged dq-dsp-firmware.bin --out-dir dist
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Upload firmware package
+        uses: actions/upload-artifact@v4
+        with:
+          name: dq-dsp-firmware-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified firmware
+        uses: actions/download-artifact@v4
+        with:
+          name: dq-dsp-firmware-${{ github.sha }}
+          path: dist
+
+      - name: Verify checksums
+        working-directory: dist
+        run: sha256sum -c SHA256SUMS
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --verify-tag \
+              --title "$GITHUB_REF_NAME — ESP32-S3 firmware" --generate-notes
+          fi
